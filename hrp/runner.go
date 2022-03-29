@@ -1,14 +1,12 @@
 package hrp
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
 	"crypto/tls"
 	_ "embed"
 	"fmt"
-	"html/template"
 	"io"
 	"io/fs"
 	"net"
@@ -615,100 +613,6 @@ func (r *Rendezvous) setReleased() {
 	atomic.StoreUint32(&r.releasedFlag, 1)
 }
 
-func initRendezvous(testcase *TestCase, total int64) []*Rendezvous {
-	tCase := testcase.ToTCase()
-	var rendezvousList []*Rendezvous
-	for _, step := range tCase.TestSteps {
-		if step.Rendezvous == nil {
-			continue
-		}
-		rendezvous := step.Rendezvous
-
-		// either number or percent should be correctly put, otherwise set to default (total)
-		if rendezvous.Number == 0 && rendezvous.Percent > 0 && rendezvous.Percent <= defaultRendezvousPercent {
-			rendezvous.Number = int64(rendezvous.Percent * float32(total))
-		} else if rendezvous.Number > 0 && rendezvous.Number <= total && rendezvous.Percent == 0 {
-			rendezvous.Percent = float32(rendezvous.Number) / float32(total)
-		} else {
-			log.Warn().
-				Str("name", rendezvous.Name).
-				Int64("default number", total).
-				Float32("default percent", defaultRendezvousPercent).
-				Msg("rendezvous parameter not defined or error, set to default value")
-			rendezvous.Number = total
-			rendezvous.Percent = defaultRendezvousPercent
-		}
-
-		if rendezvous.Timeout <= 0 {
-			rendezvous.Timeout = defaultRendezvousTimeout
-		}
-
-		rendezvous.reset()
-		rendezvousList = append(rendezvousList, rendezvous)
-	}
-	return rendezvousList
-}
-
-func waitRendezvous(rendezvousList []*Rendezvous) {
-	if rendezvousList != nil {
-		lastRendezvous := rendezvousList[len(rendezvousList)-1]
-		for _, rendezvous := range rendezvousList {
-			go waitSingleRendezvous(rendezvous, rendezvousList, lastRendezvous)
-		}
-	}
-}
-
-func waitSingleRendezvous(rendezvous *Rendezvous, rendezvousList []*Rendezvous, lastRendezvous *Rendezvous) {
-	for {
-		// cycle start: block current checking until current rendezvous activated
-		<-rendezvous.activateChan
-		stop := make(chan struct{})
-		timeout := time.Duration(rendezvous.Timeout) * time.Millisecond
-		timer := time.NewTimer(timeout)
-		go func() {
-			defer close(stop)
-			rendezvous.wg.Wait()
-		}()
-		for !rendezvous.isReleased() {
-			select {
-			case <-rendezvous.timerResetChan:
-				timer.Reset(timeout)
-			case <-stop:
-				rendezvous.setReleased()
-				close(rendezvous.releaseChan)
-				log.Info().
-					Str("name", rendezvous.Name).
-					Float32("percent", rendezvous.Percent).
-					Int64("number", rendezvous.Number).
-					Int64("timeout(ms)", rendezvous.Timeout).
-					Int64("cnt", rendezvous.cnt).
-					Str("reason", "rendezvous release condition satisfied").
-					Msg("rendezvous released")
-			case <-timer.C:
-				rendezvous.setReleased()
-				close(rendezvous.releaseChan)
-				log.Info().
-					Str("name", rendezvous.Name).
-					Float32("percent", rendezvous.Percent).
-					Int64("number", rendezvous.Number).
-					Int64("timeout(ms)", rendezvous.Timeout).
-					Int64("cnt", rendezvous.cnt).
-					Str("reason", "time's up").
-					Msg("rendezvous released")
-			}
-		}
-		// cycle end: reset all previous rendezvous after last rendezvous released
-		// otherwise, block current checker until the last rendezvous end
-		if rendezvous == lastRendezvous {
-			for _, r := range rendezvousList {
-				r.reset()
-			}
-		} else {
-			<-lastRendezvous.releaseChan
-		}
-	}
-}
-
 func (r *caseRunner) runStepRequest(step *TStep) (stepResult *stepData, err error) {
 	stepResult = &stepData{
 		Name:        step.Name,
@@ -726,7 +630,7 @@ func (r *caseRunner) runStepRequest(step *TStep) (stepResult *stepData, err erro
 	rawUrl := step.Request.URL
 	method := step.Request.Method
 	req := &http.Request{
-		Method:     method,
+		Method:     string(method),
 		Header:     make(http.Header),
 		Proto:      "HTTP/1.1",
 		ProtoMajor: 1,
@@ -849,7 +753,9 @@ func (r *caseRunner) runStepRequest(step *TStep) (stepResult *stepData, err erro
 		default: // unexpected body type
 			return stepResult, errors.New("unexpected request body type")
 		}
-		setBodyBytes(req, dataBytes)
+
+		req.Body = io.NopCloser(bytes.NewReader(dataBytes))
+		req.ContentLength = int64(len(dataBytes))
 	}
 	// update header
 	headers := make(map[string]string)
@@ -1080,57 +986,4 @@ func (r *caseRunner) parseConfig(cfg *TConfig) error {
 	cfg.ThinkTime.checkThinkTime()
 
 	return nil
-}
-
-func newSummary() *testCaseSummary {
-	return &testCaseSummary{
-		Success: true,
-		Stat:    &testStepStat{},
-		Time:    &testCaseTime{},
-		InOut:   &testCaseInOut{},
-	}
-}
-
-func (r *caseRunner) getSummary() *testCaseSummary {
-	caseSummary := r.summary
-	caseSummary.Time.StartAt = r.startTime
-	caseSummary.Time.Duration = time.Since(r.startTime).Seconds()
-	exportVars := make(map[string]interface{})
-	for _, value := range r.Config.Export {
-		exportVars[value] = r.sessionVariables[value]
-	}
-	caseSummary.InOut.ExportVars = exportVars
-	caseSummary.InOut.ConfigVars = r.Config.Variables
-	return caseSummary
-}
-
-func setBodyBytes(req *http.Request, data []byte) {
-	req.Body = io.NopCloser(bytes.NewReader(data))
-	req.ContentLength = int64(len(data))
-}
-
-//go:embed internal/scaffold/templates/report/template.html
-var reportTemplate string
-
-func (s *Summary) genHTMLReport() error {
-	dir, _ := filepath.Split(reportPath)
-	err := builtin.EnsureFolderExists(dir)
-	if err != nil {
-		return err
-	}
-	file, err := os.OpenFile(fmt.Sprintf(reportPath, s.Time.StartAt.Unix()), os.O_WRONLY|os.O_CREATE, 0666)
-	if err != nil {
-		log.Error().Err(err).Msg("open file failed")
-		return err
-	}
-	defer file.Close()
-	writer := bufio.NewWriter(file)
-	tmpl := template.Must(template.New("report").Parse(reportTemplate))
-	err = tmpl.Execute(writer, s)
-	if err != nil {
-		log.Error().Err(err).Msg("execute applies a parsed template to the specified data object failed")
-		return err
-	}
-	err = writer.Flush()
-	return err
 }
